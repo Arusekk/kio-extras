@@ -2,3 +2,9 @@ Please refer to the KDE Community Wiki article,
 https://community.kde.org/Guidelines_and_HOWTOs/Debugging
 
 Happy debugging.
+
+Developing can be done with:
+
+export QT_PLUGIN_PATH=$PWD/build/bin
+export QT_LOGGING_RULES='kf.kio.workers.9p=true;kf.kio.workers.9p.trace=true'
+kioclient cat ninep://192.168.1.1/cfg/plan9.ini

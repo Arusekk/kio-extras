@@ -184,6 +184,7 @@ if(Phonon4Qt6_FOUND)
 endif()
 add_subdirectory( info )
 add_subdirectory( archive )
+add_subdirectory( 9p )
 if (NOT WIN32)
     # does not compile: fish.cpp(41): fatal error C1083: Cannot open include file: 'sys/resource.h': No such file or directory
     # Used for getting the resource limit for closing all child process FDs. Could be completely replaced by fcloseall() if available for Unix or _fcloseall() for Windows, either conditionally on Q_OS_type or using a configure test.
