@@ -320,8 +320,9 @@ KIO::WorkerResult P9Worker::sendCmd(enum p9cmd type, quint16 tag, const QByteArr
 
 KIO::WorkerResult P9Worker::recvCmd(enum p9cmd type, quint16 tag)
 {
+    qCDebug(KIO_9P_TRACE_LOG) << "recving";
     mSession->waitForReadyRead(30 * 1000);
-    QByteArray head = mSession->read(4);
+    QByteArray head = recvExact(4);
     if (head.size() == 0)
         return Result::fail(ERR_WORKER_DEFINED, tr("read: %1").arg(mSession->errorString()));
     if (head.size() != 4)
@@ -329,8 +330,8 @@ KIO::WorkerResult P9Worker::recvCmd(enum p9cmd type, quint16 tag)
     quint32 n = head[0] | head[1] << 8 | head[2] << 16 | head[3] << 24;
     if (n < 7)
         return Result::fail(ERR_WORKER_DEFINED, tr("Malformed packet"));
-    QByteArray payload = mSession->read(n - 4);
-    qCDebug(KIO_9P_TRACE_LOG) << "recving " << payload;
+    QByteArray payload = recvExact(n - 4);
+    qCDebug(KIO_9P_TRACE_LOG) << "recvd " << payload;
     P9DataStream ds(payload);
 
     quint8 cmd;
@@ -412,6 +413,22 @@ KIO::WorkerResult P9Worker::recvCmd(enum p9cmd type, quint16 tag)
     return Result::pass();
 }
 
+QByteArray P9Worker::recvExact(qsizetype size)
+{
+    QByteArray payload = mSession->read(size);
+    if (payload.isEmpty())
+        return payload;
+    while (payload.size() < size) {
+        mSession->waitForReadyRead(3 * 1000);
+        // suboptimal: could fill the bytearray in place
+        QByteArray nxt = mSession->read(size - payload.size());
+        if (nxt.isEmpty())
+            break;
+        payload += nxt;
+    }
+    return payload;
+}
+
 KIO::WorkerResult P9Worker::stat(const QUrl &url)
 {
     Result res = openConnection();
@@ -430,10 +447,13 @@ KIO::WorkerResult P9Worker::listDir(const QUrl &url)
     Result res = openConnection();
     if (!res.success())
         return res;
-    quint32 fid = ++mMaxFid;
-    res = walk(0, fid, url.path().mid(1).split('/'));
-    if (!res.success())
-        return res;
+    quint32 fid = 0;
+    if (url.path() != "/") {
+        fid = ++mMaxFid;
+        res = walk(0, fid, url.path().mid(1).split('/'));
+        if (!res.success())
+            return res;
+    }
 
     res = open(fid, OREAD);
     if (!res.success())

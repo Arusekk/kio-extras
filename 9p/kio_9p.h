@@ -10,6 +10,7 @@
 #include <KIO/Global>
 #include <KIO/WorkerBase>
 
+#include <QByteArray>
 #include <QUrl>
 
 class QTcpSocket;
@@ -143,6 +144,7 @@ private: // Private variables
 
     Q_REQUIRED_RESULT Result sendCmd(enum p9cmd cmd, quint16 tag, const QByteArray &payload);
     Q_REQUIRED_RESULT Result recvCmd(enum p9cmd cmd, quint16 tag);
+    Q_REQUIRED_RESULT QByteArray recvExact(qsizetype size);
 
     friend class P9DataStream;
 };
