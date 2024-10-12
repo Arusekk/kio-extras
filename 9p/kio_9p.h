@@ -28,7 +28,6 @@ public:
     Q_REQUIRED_RESULT Result get(const QUrl &url) override;
     Q_REQUIRED_RESULT Result listDir(const QUrl &url) override;
     Q_REQUIRED_RESULT Result stat(const QUrl &url) override;
-    Q_REQUIRED_RESULT Result copy(const QUrl &src, const QUrl &dest, int permissions, KIO::JobFlags flags) override;
     Q_REQUIRED_RESULT Result put(const QUrl &url, int permissions, KIO::JobFlags flags) override;
     void closeConnection() override;
     void worker_status() override;
@@ -38,16 +37,14 @@ public:
     Q_REQUIRED_RESULT Result mkdir(const QUrl &url, int permissions) override;
     Q_REQUIRED_RESULT Result openConnection() override;
 
-#if 0
     // KIO::FileJob interface
-    Q_REQUIRED_RESULT Result open(const QUrl &url, QIODevice::OpenMode mode) override;
+    Q_REQUIRED_RESULT Result open(const QUrl &url, QIODevice::OpenMode mode = QIODevice::ReadOnly) override;
     Q_REQUIRED_RESULT Result read(KIO::filesize_t size) override;
     Q_REQUIRED_RESULT Result write(const QByteArray &data) override;
     Q_REQUIRED_RESULT Result seek(KIO::filesize_t offset) override;
     Q_REQUIRED_RESULT Result truncate(KIO::filesize_t length) override;
     Q_REQUIRED_RESULT Result close() override;
-    Q_REQUIRED_RESULT Result special(const QByteArray &data) override;
-#endif
+    // Q_REQUIRED_RESULT Result special(const QByteArray &data) override;
 
     // Must call after construction!
     // Bit rubbish, but we need to return something on init.
@@ -57,8 +54,12 @@ public:
     Q_REQUIRED_RESULT Result attach(quint32 afid, quint32 fid, QString uname, QString aname);
     Q_REQUIRED_RESULT Result walk(quint32 fid, quint32 nfid, QStringList walks);
     Q_REQUIRED_RESULT Result read(quint32 fid, quint64 offset, quint32 count);
+    Q_REQUIRED_RESULT Result write(quint32 fid, quint64 offset, QByteArray data);
     Q_REQUIRED_RESULT Result open(quint32 fid, quint8 mode);
+    Q_REQUIRED_RESULT Result create(quint32 fid, QString name, quint32 perm, quint8 mode);
     Q_REQUIRED_RESULT Result stat(quint32 fid);
+    Q_REQUIRED_RESULT Result clunk(quint32 fid);
+    Q_REQUIRED_RESULT Result remove(quint32 fid);
 
 private: // Private variables
     enum p9cmd {
@@ -73,12 +74,20 @@ private: // Private variables
         Rwalk = 111,
         Topen = 112,
         Ropen = 113,
+        Tcreate = 114,
+        Rcreate = 115,
         Tread = 116,
         Rread = 117,
+        Twrite = 118,
+        Rwrite = 119,
         Tclunk = 120,
         Rclunk = 121,
+        Tremove = 122,
+        Rremove = 123,
         Tstat = 124,
         Rstat = 125,
+        Twstat = 126,
+        Rwstat = 127,
     };
     enum omode {
         OREAD = 0,
@@ -132,6 +141,9 @@ private: // Private variables
 
     /** Current top file id. */
     quint32 mMaxFid = 0;
+
+    /** Current file id. */
+    quint32 mLastFid = 0;
 
     /** If open URL is dir */
     bool mIsDir;

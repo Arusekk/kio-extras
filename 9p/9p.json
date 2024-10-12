@@ -4,8 +4,6 @@
             "Class": ":internet",
             "Icon": "folder-remote",
             "X-DocPath": "kioworker6/9p/index.html",
-            "copyFromFile": true,
-            "copyToFile": true,
             "deleting": true,
             "input": "none",
             "linking": true,

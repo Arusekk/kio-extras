@@ -266,6 +266,45 @@ KIO::WorkerResult P9Worker::read(quint32 fid, quint64 offset, quint32 count)
     return recvCmd(Rread, 0);
 }
 
+KIO::WorkerResult P9Worker::write(quint32 fid, quint64 offset, QByteArray data)
+{
+    QByteArray payload;
+    {
+        P9DataStream ds(&payload);
+        ds << fid << offset << (quint32)data.size() << data;
+    }
+    Result res = sendCmd(Twrite, 0, payload);
+    if (!res.success())
+        return res;
+    return recvCmd(Rwrite, 0);
+}
+
+KIO::WorkerResult P9Worker::clunk(quint32 fid)
+{
+    QByteArray payload;
+    {
+        P9DataStream ds(&payload);
+        ds << fid;
+    }
+    Result res = sendCmd(Tclunk, 0, payload);
+    if (!res.success())
+        return res;
+    return recvCmd(Rclunk, 0);
+}
+
+KIO::WorkerResult P9Worker::remove(quint32 fid)
+{
+    QByteArray payload;
+    {
+        P9DataStream ds(&payload);
+        ds << fid;
+    }
+    Result res = sendCmd(Tremove, 0, payload);
+    if (!res.success())
+        return res;
+    return recvCmd(Rremove, 0);
+}
+
 KIO::WorkerResult P9Worker::open(quint32 fid, quint8 mode)
 {
     QByteArray payload;
@@ -277,6 +316,19 @@ KIO::WorkerResult P9Worker::open(quint32 fid, quint8 mode)
     if (!res.success())
         return res;
     return recvCmd(Ropen, 0);
+}
+
+KIO::WorkerResult P9Worker::create(quint32 fid, QString name, quint32 perm, quint8 mode)
+{
+    QByteArray payload;
+    {
+        P9DataStream ds(&payload);
+        ds << fid << name << perm << mode;
+    }
+    Result res = sendCmd(Tcreate, 0, payload);
+    if (!res.success())
+        return res;
+    return recvCmd(Rcreate, 0);
 }
 
 KIO::WorkerResult P9Worker::stat(quint32 fid)
@@ -382,6 +434,12 @@ KIO::WorkerResult P9Worker::recvCmd(enum p9cmd type, quint16 tag)
         mIsDir = qid.qid_type & 0x80;
         break;
     }
+    case Rcreate: {
+        p9qid qid;
+        quint32 iounit;
+        ds >> qid >> iounit;
+        break;
+    }
     case Rwalk: {
         quint16 nqids;
         ds >> nqids;
@@ -396,6 +454,9 @@ KIO::WorkerResult P9Worker::recvCmd(enum p9cmd type, quint16 tag)
     case Rread: {
         quint32 count;
         ds >> count;
+        openOffset += count;
+        if (count == 0)
+            return Result::fail(ERR_WORKER_DEFINED, "EOF");
         QByteArray filedata(count, Qt::Initialization());
         ds >> filedata;
         if (mIsDir) {
@@ -405,8 +466,16 @@ KIO::WorkerResult P9Worker::recvCmd(enum p9cmd type, quint16 tag)
                 ds2 >> entry;
                 listEntry(entry);
             }
-        } else
+        } else {
+            processedSize(openOffset);
             data(filedata);
+        }
+        break;
+    }
+    case Rwrite: {
+        quint32 count;
+        ds >> count;
+        openOffset += count;
         break;
     }
     }
@@ -434,83 +503,180 @@ KIO::WorkerResult P9Worker::stat(const QUrl &url)
     Result res = openConnection();
     if (!res.success())
         return res;
-    quint32 fid = ++mMaxFid;
-    res = walk(0, fid, url.path().mid(1).split('/'));
-    if (!res.success())
-        return res;
+    quint32 fid = 0;
+    if (url.path() != "/") {
+        fid = ++mMaxFid;
+        res = walk(0, fid, url.path().split('/', Qt::SkipEmptyParts));
+        if (!res.success())
+            return res;
+    }
 
     return stat(fid);
 }
 
 KIO::WorkerResult P9Worker::listDir(const QUrl &url)
 {
-    Result res = openConnection();
+    Result res = open(url);
     if (!res.success())
         return res;
-    quint32 fid = 0;
-    if (url.path() != "/") {
-        fid = ++mMaxFid;
-        res = walk(0, fid, url.path().mid(1).split('/'));
+
+    while (true) {
+        res = read(8192);
         if (!res.success())
-            return res;
+            break;
     }
-
-    res = open(fid, OREAD);
-    if (!res.success())
-        return res;
-
-    return read(fid, 0, 8192);
+    if (res.errorString() == "EOF")
+        res = Result::pass();
+    return res;
 }
 
 KIO::WorkerResult P9Worker::mkdir(const QUrl &url, int permissions)
 {
-    return Result::pass();
+    Result res = openConnection();
+    if (!res.success())
+        return res;
+
+    QStringList components = url.path().split('/', Qt::SkipEmptyParts);
+    if (components.empty())
+        return Result::fail(ERR_WORKER_DEFINED, "mkdir root dir");
+    QString newName = components.takeLast();
+
+    quint32 fid = ++mMaxFid;
+    res = walk(0, fid, components);
+    if (!res.success())
+        return res;
+
+    res = create(fid, newName, permissions | DMDIR, OREAD);
+    if (!res.success())
+        return res;
+
+    clunk(fid);
+    if (fid == mMaxFid)
+        mMaxFid--;
+    return res;
 }
 
 KIO::WorkerResult P9Worker::rename(const QUrl &src, const QUrl &dst, JobFlags flags)
 {
+    // TODO: wstat(5)
     return Result::pass();
 }
 
 KIO::WorkerResult P9Worker::del(const QUrl &url, bool isfile)
 {
-    return Result::pass();
+    Result res = openConnection();
+    if (!res.success())
+        return res;
+
+    quint32 fid = ++mMaxFid;
+    res = walk(0, fid, url.path().split('/', Qt::SkipEmptyParts));
+    if (!res.success())
+        return res;
+
+    res = remove(fid);
+    if (fid == mMaxFid)
+        mMaxFid--;
+    return res;
 }
 
 KIO::WorkerResult P9Worker::chmod(const QUrl &url, int permissions)
 {
+    // TODO: wstat(5)
     return Result::pass();
 }
 
 KIO::WorkerResult P9Worker::get(const QUrl &url)
 {
-    Result res = openConnection();
-    if (!res.success())
-        return res;
-    quint32 fid = ++mMaxFid;
-    res = walk(0, fid, url.path().mid(1).split('/'));
+    Result res = open(url);
     if (!res.success())
         return res;
 
-    res = open(fid, OREAD);
-    if (!res.success())
-        return res;
-
-    return read(fid, 0, 8192);
+    while (true) {
+        res = read(8192);
+        if (!res.success())
+            break;
+    }
+    if (res.errorString() == "EOF")
+        res = Result::pass();
+    return res;
 }
 
 KIO::WorkerResult P9Worker::put(const QUrl &url, int permissions, JobFlags flags)
 {
-    return Result::pass();
+    Result res = openConnection();
+    if (!res.success())
+        return res;
+
+    QStringList components = url.path().split('/', Qt::SkipEmptyParts);
+    if (components.empty())
+        return Result::fail(ERR_WORKER_DEFINED, "put root dir");
+    QString newName = components.takeLast();
+
+    quint32 fid = ++mMaxFid;
+    res = walk(0, fid, components);
+    if (!res.success())
+        return res;
+
+    res = create(fid, newName, permissions, OWRITE);
+    if (!res.success())
+        return res;
+    mLastFid = fid;
+
+    res = write("whatever data");
+
+    clunk(fid);
+    if (fid == mMaxFid)
+        mMaxFid--;
+    return res;
 }
 
 void P9Worker::worker_status()
 {
 }
 
-KIO::WorkerResult P9Worker::copy(const QUrl &src, const QUrl &dest, int permissions, JobFlags flags)
+Result P9Worker::open(const QUrl &url, QIODevice::OpenMode mode)
 {
+    Result res = openConnection();
+    if (!res.success())
+        return res;
+
+    quint32 fid = ++mMaxFid;
+    res = walk(0, fid, url.path().split('/', Qt::SkipEmptyParts));
+    if (!res.success())
+        return res;
+    mLastFid = fid;
+
+    quint8 p9mode = (mode & QIODevice::ReadWrite) == QIODevice::ReadWrite ? ORDWR : (mode & QIODevice::WriteOnly) ? OWRITE : OREAD;
+    if (mode & QIODevice::Truncate)
+        p9mode |= OTRUNC;
+    // TODO: NewOnly, ExistingOnly: see open(5)
+    openOffset = 0;
+    return open(fid, p9mode);
+}
+Result P9Worker::read(KIO::filesize_t size)
+{
+    return read(mLastFid, openOffset, size);
+}
+Result P9Worker::write(const QByteArray &data)
+{
+    return write(mLastFid, openOffset, data);
+}
+Result P9Worker::seek(KIO::filesize_t offset)
+{
+    openOffset = offset;
     return Result::pass();
+}
+Result P9Worker::truncate(KIO::filesize_t length)
+{
+    // TODO: wstat(5)
+    return Result::pass();
+}
+
+Result P9Worker::close()
+{
+    if (!mLastFid)
+        return Result::pass();
+    return clunk(mMaxFid--);
 }
 
 QDebug operator<<(QDebug dbg, const Result &r)
