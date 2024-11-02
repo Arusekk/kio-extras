@@ -8,6 +8,8 @@
 
 #include <QCoreApplication>
 #include <QTcpSocket>
+#include <kio/global.h>
+#include <kio/job_base.h>
 
 #include "kio_9p_debug.h"
 #include "kio_9p_trace_debug.h"
@@ -123,6 +125,11 @@ public:
         *this >> qid.qid_type >> qid.qid_version >> qid.qid_path;
         return *this;
     }
+    P9DataStream &operator<<(const P9Worker::p9qid &qid)
+    {
+        *this << qid.qid_type << qid.qid_version << qid.qid_path;
+        return *this;
+    }
     P9DataStream &operator>>(P9Worker::p9statbuf &buf)
     {
         quint16 n;
@@ -138,6 +145,22 @@ public:
         sub >> buf.length;
         sub >> buf.name;
         sub >> buf.uid >> buf.gid >> buf.muid;
+        return *this;
+    }
+    P9DataStream &operator<<(const P9Worker::p9statbuf &buf)
+    {
+        QByteArray b;
+        P9DataStream sub(&b);
+        sub << buf.type << buf.dev;
+        sub << buf.qid;
+        sub << buf.mode;
+        sub << buf.atime << buf.mtime;
+        sub << buf.length;
+        sub << buf.name;
+        sub << buf.uid << buf.gid << buf.muid;
+
+        *this << (quint16)(b.size() + 2) << (quint16)b.size() << b;
+
         return *this;
     }
     P9DataStream &operator>>(UDSEntry &entry)
@@ -207,7 +230,14 @@ KIO::WorkerResult P9Worker::negotiateVersion()
     Result res = sendCmd(Tversion, 0xffff, payload);
     if (!res.success())
         return res;
-    return recvCmd(Rversion, 0xffff);
+    return recvCmd(Rversion, 0xffff, [&](P9DataStream &ds) {
+        ds >> mMax;
+        QString ver;
+        ds >> ver;
+        if (ver != proto)
+            return Result::fail(ERR_CANNOT_CONNECT, tr("9P version not implemented: %1").arg(ver));
+        return Result::pass();
+    });
 }
 
 KIO::WorkerResult P9Worker::authenticate(quint32 afid, QString uname, QString aname)
@@ -221,7 +251,9 @@ KIO::WorkerResult P9Worker::authenticate(quint32 afid, QString uname, QString an
     Result res = sendCmd(Tauth, 0, payload);
     if (!res.success())
         return res;
-    return recvCmd(Rauth, 0);
+    return recvCmd(Rauth, 0, [&](P9DataStream &) {
+        return Result::pass();
+    });
 }
 
 KIO::WorkerResult P9Worker::attach(quint32 fid, quint32 afid, QString uname, QString aname)
@@ -235,7 +267,11 @@ KIO::WorkerResult P9Worker::attach(quint32 fid, quint32 afid, QString uname, QSt
     Result res = sendCmd(Tattach, 0, payload);
     if (!res.success())
         return res;
-    return recvCmd(Rattach, 0);
+    return recvCmd(Rattach, 0, [&](P9DataStream &ds) {
+        p9qid qid;
+        ds >> qid;
+        return Result::pass();
+    });
 }
 
 KIO::WorkerResult P9Worker::walk(quint32 fid, quint32 nfid, QStringList walks)
@@ -250,10 +286,29 @@ KIO::WorkerResult P9Worker::walk(quint32 fid, quint32 nfid, QStringList walks)
     Result res = sendCmd(Twalk, 0, payload);
     if (!res.success())
         return res;
-    return recvCmd(Rwalk, 0);
+    return recvCmd(Rwalk, 0, [&](P9DataStream &ds) {
+        quint16 nqids;
+        ds >> nqids;
+        // nqids < nwalks indicates partial success
+        // need to walk to returned depth and walk the offending component again to get error cause
+        for (quint16 i = 0; i < nqids; i++) {
+            p9qid qid;
+            ds >> qid;
+        }
+        if (nqids < walks.size()) {
+            if (nqids == 0)
+                return Result::fail(ERR_WORKER_DEFINED, tr("zero partial walk"));
+            int fidx = ++mMaxFid;
+            res = walk(fid, fidx, walks.mid(0, nqids));
+            if (!res.success())
+                return res;
+            return walk(fidx, nfid, walks.mid(nqids));
+        }
+        return Result::pass();
+    });
 }
 
-KIO::WorkerResult P9Worker::read(quint32 fid, quint64 offset, quint32 count)
+KIO::WorkerResult P9Worker::read(quint32 fid, quint64 offset, quint32 count, std::function<Result(QByteArray &)> callback)
 {
     QByteArray payload;
     {
@@ -263,7 +318,16 @@ KIO::WorkerResult P9Worker::read(quint32 fid, quint64 offset, quint32 count)
     Result res = sendCmd(Tread, 0, payload);
     if (!res.success())
         return res;
-    return recvCmd(Rread, 0);
+    return recvCmd(Rread, 0, [&](P9DataStream &ds) {
+        quint32 count;
+        ds >> count;
+        if (!count)
+            return Result::fail(ERR_WORKER_DEFINED, "EOF");
+        openOffset += count;
+        QByteArray filedata(count, Qt::Initialization());
+        ds >> filedata;
+        return callback(filedata);
+    });
 }
 
 KIO::WorkerResult P9Worker::write(quint32 fid, quint64 offset, QByteArray data)
@@ -276,7 +340,12 @@ KIO::WorkerResult P9Worker::write(quint32 fid, quint64 offset, QByteArray data)
     Result res = sendCmd(Twrite, 0, payload);
     if (!res.success())
         return res;
-    return recvCmd(Rwrite, 0);
+    return recvCmd(Rwrite, 0, [&](P9DataStream &ds) {
+        quint32 count;
+        ds >> count;
+        openOffset += count;
+        return Result::pass();
+    });
 }
 
 KIO::WorkerResult P9Worker::clunk(quint32 fid)
@@ -289,7 +358,11 @@ KIO::WorkerResult P9Worker::clunk(quint32 fid)
     Result res = sendCmd(Tclunk, 0, payload);
     if (!res.success())
         return res;
-    return recvCmd(Rclunk, 0);
+    if (fid == mMaxFid)
+        mMaxFid--;
+    return recvCmd(Rclunk, 0, [&](P9DataStream &) {
+        return Result::pass();
+    });
 }
 
 KIO::WorkerResult P9Worker::remove(quint32 fid)
@@ -302,7 +375,11 @@ KIO::WorkerResult P9Worker::remove(quint32 fid)
     Result res = sendCmd(Tremove, 0, payload);
     if (!res.success())
         return res;
-    return recvCmd(Rremove, 0);
+    if (fid == mMaxFid)
+        mMaxFid--;
+    return recvCmd(Rremove, 0, [&](P9DataStream &) {
+        return Result::pass();
+    });
 }
 
 KIO::WorkerResult P9Worker::open(quint32 fid, quint8 mode)
@@ -315,7 +392,16 @@ KIO::WorkerResult P9Worker::open(quint32 fid, quint8 mode)
     Result res = sendCmd(Topen, 0, payload);
     if (!res.success())
         return res;
-    return recvCmd(Ropen, 0);
+    return recvCmd(Ropen, 0, [&](P9DataStream &ds) {
+        p9qid qid;
+        quint32 iounit;
+        ds >> qid >> iounit;
+        if (qid.qid_type & 0x80)
+            mimeType("inode/directory");
+        else
+            mimeType("application/octet-stream");
+        return Result::pass();
+    });
 }
 
 KIO::WorkerResult P9Worker::create(quint32 fid, QString name, quint32 perm, quint8 mode)
@@ -328,10 +414,15 @@ KIO::WorkerResult P9Worker::create(quint32 fid, QString name, quint32 perm, quin
     Result res = sendCmd(Tcreate, 0, payload);
     if (!res.success())
         return res;
-    return recvCmd(Rcreate, 0);
+    return recvCmd(Rcreate, 0, [&](P9DataStream &ds) {
+        p9qid qid;
+        quint32 iounit;
+        ds >> qid >> iounit;
+        return Result::pass();
+    });
 }
 
-KIO::WorkerResult P9Worker::stat(quint32 fid)
+KIO::WorkerResult P9Worker::stat(quint32 fid, std::function<void(UDSEntry &)> callback)
 {
     QByteArray payload;
     {
@@ -341,7 +432,31 @@ KIO::WorkerResult P9Worker::stat(quint32 fid)
     Result res = sendCmd(Tstat, 0, payload);
     if (!res.success())
         return res;
-    return recvCmd(Rstat, 0);
+
+    return recvCmd(Rstat, 0, [&](P9DataStream &ds) {
+        quint16 ign; // ignore; must be len(entry) + 2
+        UDSEntry entry;
+        ds >> ign >> entry;
+        callback(entry);
+        return Result::pass();
+    });
+}
+
+KIO::WorkerResult P9Worker::wstat(quint32 fid, const p9statbuf &buf)
+{
+    QByteArray payload;
+    {
+        P9DataStream ds(&payload);
+        ds << fid;
+        ds << buf;
+    }
+    Result res = sendCmd(Twstat, 0, payload);
+    if (!res.success())
+        return res;
+
+    return recvCmd(Rwstat, 0, [&](P9DataStream &) {
+        return Result::pass();
+    });
 }
 
 void P9Worker::closeConnection()
@@ -370,7 +485,7 @@ KIO::WorkerResult P9Worker::sendCmd(enum p9cmd type, quint16 tag, const QByteArr
     return Result::pass();
 }
 
-KIO::WorkerResult P9Worker::recvCmd(enum p9cmd type, quint16 tag)
+KIO::WorkerResult P9Worker::recvCmd(enum p9cmd type, quint16 tag, std::function<Result(P9DataStream &)> callback)
 {
     qCDebug(KIO_9P_TRACE_LOG) << "recving";
     mSession->waitForReadyRead(30 * 1000);
@@ -403,83 +518,7 @@ KIO::WorkerResult P9Worker::recvCmd(enum p9cmd type, quint16 tag)
     if (cmd != type)
         return Result::fail(ERR_WORKER_DEFINED, tr("Unexpected response: %1 (expected %2)").arg(type, cmd));
 
-    switch (cmd) {
-    case Rversion: {
-        ds >> mMax;
-        QString ver;
-        ds >> ver;
-        if (ver != "9P2000")
-            return Result::fail(ERR_CANNOT_CONNECT, "9P version not implemented: " + ver);
-        break;
-    }
-    case Rattach: {
-        p9qid qid;
-        ds >> qid;
-        break;
-    }
-    case Rstat: {
-        UDSEntry entry;
-        ds >> entry;
-        statEntry(entry);
-        break;
-    }
-    case Ropen: {
-        p9qid qid;
-        quint32 iounit;
-        ds >> qid >> iounit;
-        if (qid.qid_type & 0x80)
-            mimeType("inode/directory");
-        else
-            mimeType("application/octet-stream");
-        mIsDir = qid.qid_type & 0x80;
-        break;
-    }
-    case Rcreate: {
-        p9qid qid;
-        quint32 iounit;
-        ds >> qid >> iounit;
-        break;
-    }
-    case Rwalk: {
-        quint16 nqids;
-        ds >> nqids;
-        // nqids < nwalks indicates partial success
-        // need to walk to returned depth and walk the offending component again to get error cause
-        for (quint16 i = 0; i < nqids; i++) {
-            p9qid qid;
-            ds >> qid;
-        }
-        break;
-    }
-    case Rread: {
-        quint32 count;
-        ds >> count;
-        openOffset += count;
-        if (count == 0)
-            return Result::fail(ERR_WORKER_DEFINED, "EOF");
-        QByteArray filedata(count, Qt::Initialization());
-        ds >> filedata;
-        if (mIsDir) {
-            P9DataStream ds2(filedata);
-            UDSEntry entry;
-            while (!ds2.atEnd()) {
-                ds2 >> entry;
-                listEntry(entry);
-            }
-        } else {
-            processedSize(openOffset);
-            data(filedata);
-        }
-        break;
-    }
-    case Rwrite: {
-        quint32 count;
-        ds >> count;
-        openOffset += count;
-        break;
-    }
-    }
-    return Result::pass();
+    return callback(ds);
 }
 
 QByteArray P9Worker::recvExact(qsizetype size)
@@ -511,7 +550,9 @@ KIO::WorkerResult P9Worker::stat(const QUrl &url)
             return res;
     }
 
-    return stat(fid);
+    return stat(fid, [&](UDSEntry &entry) {
+        statEntry(entry);
+    });
 }
 
 KIO::WorkerResult P9Worker::listDir(const QUrl &url)
@@ -520,8 +561,23 @@ KIO::WorkerResult P9Worker::listDir(const QUrl &url)
     if (!res.success())
         return res;
 
+    res = stat(mLastFid, [&](UDSEntry &entry) {
+        qCDebug(KIO_9P_LOG) << "UDS " << entry;
+        entry.replace(KIO::UDSEntry::UDS_NAME, ".");
+        listEntry(entry);
+    });
+    if (!res.success())
+        return res;
     while (true) {
-        res = read(8192);
+        res = read(mLastFid, openOffset, 8192, [&](QByteArray &filedata) {
+            P9DataStream ds2(filedata);
+            UDSEntry entry;
+            while (!ds2.atEnd()) {
+                ds2 >> entry;
+                listEntry(entry);
+            }
+            return Result::pass();
+        });
         if (!res.success())
             break;
     }
@@ -550,16 +606,35 @@ KIO::WorkerResult P9Worker::mkdir(const QUrl &url, int permissions)
     if (!res.success())
         return res;
 
-    clunk(fid);
-    if (fid == mMaxFid)
-        mMaxFid--;
+    // (void)clunk(fid);
     return res;
 }
 
 KIO::WorkerResult P9Worker::rename(const QUrl &src, const QUrl &dst, JobFlags flags)
 {
-    // TODO: wstat(5)
-    return Result::pass();
+    Result res = openConnection();
+    if (!res.success())
+        return res;
+
+    quint32 fid = ++mMaxFid;
+    QStringList srcList = src.path().split('/', Qt::SkipEmptyParts);
+    res = walk(0, fid, srcList);
+    if (!res.success())
+        return res;
+
+    QStringList dstList = dst.path().split('/', Qt::SkipEmptyParts);
+    p9statbuf buf;
+    buf.name = dstList.last();
+
+    res = wstat(fid, buf);
+    if (res.success())
+        return res;
+    if (!(flags & KIO::Overwrite))
+        return res;
+    res = del(dst, true);
+    if (!res.success())
+        return res;
+    return wstat(fid, buf);
 }
 
 KIO::WorkerResult P9Worker::del(const QUrl &url, bool isfile)
@@ -573,16 +648,25 @@ KIO::WorkerResult P9Worker::del(const QUrl &url, bool isfile)
     if (!res.success())
         return res;
 
+    Q_UNUSED(isfile);
     res = remove(fid);
-    if (fid == mMaxFid)
-        mMaxFid--;
     return res;
 }
 
 KIO::WorkerResult P9Worker::chmod(const QUrl &url, int permissions)
 {
-    // TODO: wstat(5)
-    return Result::pass();
+    Result res = openConnection();
+    if (!res.success())
+        return res;
+
+    quint32 fid = ++mMaxFid;
+    res = walk(0, fid, url.path().split('/', Qt::SkipEmptyParts));
+    if (!res.success())
+        return res;
+
+    p9statbuf buf;
+    buf.mode = permissions; // TODO: DMDIR from last qid from walk
+    return wstat(fid, buf);
 }
 
 KIO::WorkerResult P9Worker::get(const QUrl &url)
@@ -617,16 +701,33 @@ KIO::WorkerResult P9Worker::put(const QUrl &url, int permissions, JobFlags flags
     if (!res.success())
         return res;
 
-    res = create(fid, newName, permissions, OWRITE);
-    if (!res.success())
-        return res;
+    res = create(fid, newName, permissions & 0777, OWRITE);
+    if (!res.success()) {
+        if (res.error() != KIO::ERR_FILE_ALREADY_EXIST)
+            return res;
+        if (flags & (KIO::Overwrite | KIO::Resume))
+            return res;
+        int dfid = fid;
+        fid = ++mMaxFid;
+        res = walk(dfid, fid, {newName});
+        if (!res.success())
+            return res;
+        quint8 p9mode = OWRITE;
+        if (flags & KIO::Overwrite)
+            p9mode |= OTRUNC;
+        res = open(fid, p9mode);
+        if (!res.success())
+            return res;
+    }
     mLastFid = fid;
 
-    res = write("whatever data");
+    dataReq();
+    QByteArray arr;
+    readData(arr);
 
-    clunk(fid);
-    if (fid == mMaxFid)
-        mMaxFid--;
+    res = write(arr);
+
+    (void)clunk(fid);
     return res;
 }
 
@@ -655,7 +756,11 @@ Result P9Worker::open(const QUrl &url, QIODevice::OpenMode mode)
 }
 Result P9Worker::read(KIO::filesize_t size)
 {
-    return read(mLastFid, openOffset, size);
+    return read(mLastFid, openOffset, size, [&](QByteArray &filedata) {
+        processedSize(openOffset);
+        data(filedata);
+        return Result::pass();
+    });
 }
 Result P9Worker::write(const QByteArray &data)
 {
@@ -668,15 +773,16 @@ Result P9Worker::seek(KIO::filesize_t offset)
 }
 Result P9Worker::truncate(KIO::filesize_t length)
 {
-    // TODO: wstat(5)
-    return Result::pass();
+    p9statbuf buf;
+    buf.length = length;
+    return wstat(mLastFid, buf);
 }
 
 Result P9Worker::close()
 {
     if (!mLastFid)
         return Result::pass();
-    return clunk(mMaxFid--);
+    return clunk(mLastFid);
 }
 
 QDebug operator<<(QDebug dbg, const Result &r)

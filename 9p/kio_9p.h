@@ -17,6 +17,7 @@ class QTcpSocket;
 
 using Result = KIO::WorkerResult;
 
+class P9DataStream;
 class P9Worker : public QObject, public KIO::WorkerBase
 {
     Q_OBJECT
@@ -49,17 +50,6 @@ public:
     // Must call after construction!
     // Bit rubbish, but we need to return something on init.
     Q_REQUIRED_RESULT Result init();
-    Q_REQUIRED_RESULT Result negotiateVersion();
-    Q_REQUIRED_RESULT Result authenticate(quint32 afid, QString uname, QString aname);
-    Q_REQUIRED_RESULT Result attach(quint32 afid, quint32 fid, QString uname, QString aname);
-    Q_REQUIRED_RESULT Result walk(quint32 fid, quint32 nfid, QStringList walks);
-    Q_REQUIRED_RESULT Result read(quint32 fid, quint64 offset, quint32 count);
-    Q_REQUIRED_RESULT Result write(quint32 fid, quint64 offset, QByteArray data);
-    Q_REQUIRED_RESULT Result open(quint32 fid, quint8 mode);
-    Q_REQUIRED_RESULT Result create(quint32 fid, QString name, quint32 perm, quint8 mode);
-    Q_REQUIRED_RESULT Result stat(quint32 fid);
-    Q_REQUIRED_RESULT Result clunk(quint32 fid);
-    Q_REQUIRED_RESULT Result remove(quint32 fid);
 
 private: // Private variables
     enum p9cmd {
@@ -104,18 +94,18 @@ private: // Private variables
         DMTMP = 0x04000000,
     };
     struct p9qid {
-        quint8 qid_type;
-        quint32 qid_version;
-        quint64 qid_path;
+        quint8 qid_type = ~0;
+        quint32 qid_version = ~0;
+        quint64 qid_path = ~0;
     };
     struct p9statbuf {
-        quint16 type;
-        quint32 dev;
+        quint16 type = ~0;
+        quint32 dev = ~0;
         p9qid qid;
-        quint32 mode;
-        quint32 atime;
-        quint32 mtime;
-        quint64 length;
+        quint32 mode = ~0;
+        quint32 atime = ~0;
+        quint32 mtime = ~0;
+        quint64 length = ~0;
         QString name;
         QString uid;
         QString gid;
@@ -145,9 +135,6 @@ private: // Private variables
     /** Current file id. */
     quint32 mLastFid = 0;
 
-    /** If open URL is dir */
-    bool mIsDir;
-
     /** The open URL */
     QUrl mOpenUrl;
 
@@ -155,7 +142,19 @@ private: // Private variables
     KIO::filesize_t openOffset = 0;
 
     Q_REQUIRED_RESULT Result sendCmd(enum p9cmd cmd, quint16 tag, const QByteArray &payload);
-    Q_REQUIRED_RESULT Result recvCmd(enum p9cmd cmd, quint16 tag);
+    Q_REQUIRED_RESULT Result recvCmd(enum p9cmd cmd, quint16 tag, std::function<Result(P9DataStream &)> callback);
+    Q_REQUIRED_RESULT Result negotiateVersion();
+    Q_REQUIRED_RESULT Result authenticate(quint32 afid, QString uname, QString aname);
+    Q_REQUIRED_RESULT Result attach(quint32 afid, quint32 fid, QString uname, QString aname);
+    Q_REQUIRED_RESULT Result walk(quint32 fid, quint32 nfid, QStringList walks);
+    Q_REQUIRED_RESULT Result read(quint32 fid, quint64 offset, quint32 count, std::function<Result(QByteArray &)> callback);
+    Q_REQUIRED_RESULT Result write(quint32 fid, quint64 offset, QByteArray data);
+    Q_REQUIRED_RESULT Result open(quint32 fid, quint8 mode);
+    Q_REQUIRED_RESULT Result create(quint32 fid, QString name, quint32 perm, quint8 mode);
+    Q_REQUIRED_RESULT Result stat(quint32 fid, std::function<void(KIO::UDSEntry &)> callback);
+    Q_REQUIRED_RESULT Result wstat(quint32 fid, const p9statbuf &buf);
+    Q_REQUIRED_RESULT Result clunk(quint32 fid);
+    Q_REQUIRED_RESULT Result remove(quint32 fid);
     Q_REQUIRED_RESULT QByteArray recvExact(qsizetype size);
 
     friend class P9DataStream;
